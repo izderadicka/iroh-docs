@@ -3,17 +3,21 @@ use std::{collections::HashMap, future::Future, sync::Arc};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use iroh::{
-    address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router, Endpoint, PublicKey,
-    SecretKey,
+    address_lookup::memory::MemoryLookup,
+    endpoint::{presets, Connection},
+    protocol::{AcceptError, ProtocolHandler, Router},
+    Endpoint, PublicKey, SecretKey,
 };
 use iroh_blobs::Hash;
 use iroh_docs::{
+    actor::SyncHandle,
     api::{
         protocol::{AddrInfoOptions, ShareMode},
         Doc,
     },
     engine::LiveEvent,
-    store::{DownloadPolicy, FilterKind, Query},
+    net::{handle_connection, AbortReason, AcceptOutcome},
+    store::{DownloadPolicy, FilterKind, Query, Store},
     AuthorId, ContentStatus, Entry,
 };
 use iroh_gossip::{net::Gossip, proto::TopicId};
@@ -24,6 +28,7 @@ use n0_future::{
 use rand::{CryptoRng, RngExt, SeedableRng};
 #[cfg(feature = "fs-store")]
 use tempfile::tempdir;
+use tokio::sync::mpsc;
 use tracing::{debug, error_span, info, Instrument};
 use tracing_test::traced_test;
 mod util;
@@ -1128,6 +1133,105 @@ async fn test_list_docs_stream() -> testresult::TestResult<()> {
 }
 
 /// Get all entries of a document.
+/// A peer that refuses every sync request with `reason`, and says each time it
+/// is asked.
+#[derive(Debug, Clone)]
+struct Refusing {
+    sync: SyncHandle,
+    reason: AbortReason,
+    asked: mpsc::UnboundedSender<()>,
+}
+
+impl ProtocolHandler for Refusing {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let (reason, asked) = (self.reason, self.asked.clone());
+        let open = connection.clone();
+        handle_connection(
+            self.sync.clone(),
+            connection,
+            move |_, _| {
+                asked.send(()).ok();
+                async move { AcceptOutcome::Reject(reason) }
+            },
+            None,
+        )
+        .await
+        .ok();
+        // As a real peer does: the connection stays up until the dialer is done.
+        open.closed().await;
+        Ok(())
+    }
+}
+
+/// Asks a peer that refuses with `reason` for a sync three times. Each ask is
+/// repeated every 100ms until the peer sees it, so a round still finishing
+/// on our side does not count against us.
+async fn ask_a_refusing_peer_three_times(reason: AbortReason, seed: &[u8]) -> Result<()> {
+    const ASK_TIMEOUT: Duration = Duration::from_secs(10);
+    let mut rng = test_rng(seed);
+    let node = spawn_node(0, &mut rng).await?;
+    let doc = node.client().docs().create().await?;
+
+    let (asked, mut was_asked) = mpsc::unbounded_channel();
+    let peer = empty_endpoint().await?;
+    let _router = Router::builder(peer.clone())
+        .accept(
+            iroh_docs::ALPN,
+            Refusing {
+                sync: SyncHandle::spawn(Store::memory(), None, "refusing".to_string()),
+                reason,
+                asked,
+            },
+        )
+        .spawn();
+
+    for attempt in 1..=3 {
+        n0_future::time::timeout(ASK_TIMEOUT, async {
+            loop {
+                doc.start_sync(vec![peer.addr()]).await?;
+                tokio::select! {
+                    Some(()) = was_asked.recv() => return anyhow::Ok(()),
+                    _ = n0_future::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        })
+        .await
+        .with_context(|| {
+            format!("ask {attempt}: the peer was not asked again within {ASK_TIMEOUT:?}")
+        })??;
+    }
+
+    node.shutdown().await?;
+    Ok(())
+}
+
+/// A refused sync is asked for again: the control for the test below.
+#[tokio::test]
+#[traced_test]
+async fn sync_is_asked_again_after_a_refusal() -> Result<()> {
+    ask_a_refusing_peer_three_times(
+        AbortReason::InternalServerError,
+        b"sync_is_asked_again_after_a_refusal",
+    )
+    .await
+}
+
+/// The same after an `AlreadySyncing` refusal, which a peer gives while it is
+/// still finishing the round before.
+///
+/// Fails today: `on_sync_via_connect_finished` only logs that refusal, so the
+/// local state for the peer stays `Running` and every later `start_sync`,
+/// `NewNeighbor` or `SyncReport` for it is dropped as "sync already running".
+#[tokio::test]
+#[traced_test]
+async fn sync_is_asked_again_after_an_already_syncing_refusal() -> Result<()> {
+    ask_a_refusing_peer_three_times(
+        AbortReason::AlreadySyncing,
+        b"sync_is_asked_again_after_an_already_syncing_refusal",
+    )
+    .await
+}
+
 async fn get_all(doc: &Doc) -> anyhow::Result<Vec<Entry>> {
     let entries = doc.get_many(Query::all()).await?;
     entries.try_collect::<Vec<_>>().await
